@@ -1,0 +1,2205 @@
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
+import { Download, Image, Upload, Zap, Loader2, Aperture, Users, Check, Maximize, Minimize, X, Video, Clipboard, Wand2, Edit, RefreshCcw, Mic } from 'lucide-react'; // Menambahkan ikon RefreshCcw dan Mic
+
+// --- Konfigurasi Firebase (MANDATORY GLOBALS) ---
+const apiKey = ""; // GANTI DENGAN API KEY ANDA
+const GENERATION_MODEL = "gemini-2.5-flash-image-preview";
+const GENERATION_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GENERATION_MODEL}:generateContent?key=${apiKey}`;
+// Model untuk Teks dari Gambar (Video Prompt)
+const TEXT_GEN_MODEL = "gemini-2.5-flash-preview-09-2025";
+const TEXT_GEN_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_GEN_MODEL}:generateContent?key=${apiKey}`;
+// --- BARU: Model dan URL untuk TTS ---
+const TTS_API_MODEL = "gemini-2.5-flash-preview-tts";
+const TTS_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${TTS_API_MODEL}:generateContent?key=${apiKey}`;
+
+
+// Fungsi utilitas untuk konversi file ke Base64
+const fileToBase64 = (file) => {
+    if (!file) return null;
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = () => resolve(reader.result.split(',')[1]); // Ambil bagian base64 saja
+        reader.onerror = (error) => reject(error);
+    });
+};
+
+// Fungsi utilitas untuk menyalin ke clipboard
+const copyToClipboard = (text) => {
+    // Metode 'document.execCommand' adalah fallback yang lebih andal 
+    // di dalam lingkungan iframe yang mungkin membatasi Clipboard API modern.
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    
+    // Styling untuk menyembunyikan textarea
+    textArea.style.position = 'fixed';
+    textArea.style.top = '-9999px';
+    textArea.style.left = '-9999px';
+    textArea.style.width = '2em';
+    textArea.style.height = '2em';
+    textArea.style.padding = 0;
+    textArea.style.border = 'none';
+    textArea.style.outline = 'none';
+    textArea.style.boxShadow = 'none';
+    textArea.style.background = 'transparent';
+    
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    
+    try {
+        const successful = document.execCommand('copy');
+        if (!successful) {
+             console.error('Gagal menyalin (fallback execCommand mengembalikan false)');
+        }
+    } catch (err) {
+        console.error('Gagal menyalin (fallback exception): ', err);
+    }
+    
+    document.body.removeChild(textArea);
+};
+
+// --- FUNGSI BARU: Download Gambar Programatik ---
+// Ini untuk mencegah refresh halaman saat mengunduh
+const downloadImage = (base64Data, filename) => {
+    try {
+        const link = document.createElement('a');
+        link.href = `data:image/jpeg;base64,${base64Data}`;
+        link.download = filename;
+        
+        // Perlu ditambahkan ke DOM untuk 'click()' agar berfungsi di semua browser
+        document.body.appendChild(link);
+        link.click();
+        
+        // Hapus link setelah di-klik
+        document.body.removeChild(link);
+    } catch (err) {
+        console.error("Gagal mengunduh gambar secara programatik:", err);
+        // Fallback: coba buka di tab baru (meskipun mungkin tidak ter-download)
+        window.open(`data:image/jpeg;base64,${base64Data}`, '_blank');
+    }
+};
+
+// --- FUNGSI BARU: Utilitas untuk TTS (WAV Audio) ---
+function base64ToArrayBuffer(base64) {
+    const binaryString = atob(base64);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes.buffer;
+}
+
+function writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+    }
+}
+
+function pcmToWav(pcm16, sampleRate) {
+    const numChannels = 1;
+    const bytesPerSample = 2; // 16-bit PCM
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    
+    const dataLength = pcm16.length * bytesPerSample;
+    const buffer = new ArrayBuffer(44 + dataLength);
+    const view = new DataView(buffer);
+
+    let offset = 0;
+
+    // RIFF chunk
+    writeString(view, offset, 'RIFF'); offset += 4;
+    view.setUint32(offset, 36 + dataLength, true); offset += 4;
+    writeString(view, offset, 'WAVE'); offset += 4;
+
+    // FMT sub-chunk
+    writeString(view, offset, 'fmt '); offset += 4;
+    view.setUint32(offset, 16, true); offset += 4;
+    view.setUint16(offset, 1, true); offset += 2;
+    view.setUint16(offset, numChannels, true); offset += 2;
+    view.setUint32(offset, sampleRate, true); offset += 4;
+    view.setUint32(offset, byteRate, true); offset += 4;
+    view.setUint16(offset, blockAlign, true); offset += 2;
+    view.setUint16(offset, bytesPerSample * 8, true); offset += 2;
+
+    // DATA sub-chunk
+    writeString(view, offset, 'data'); offset += 4;
+    view.setUint32(offset, dataLength, true); offset += 4;
+
+    for (let i = 0; i < pcm16.length; i++) {
+        view.setInt16(offset, pcm16[i], true);
+        offset += bytesPerSample;
+    }
+
+    return new Blob([view], { type: 'audio/wav' });
+}
+
+// --- FUNGSI BARU: Utilitas Fetch dengan Exponential Backoff ---
+async function exponentialBackoffFetch(url, options, maxRetries = 5) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const response = await fetch(url, options);
+            if (response.status !== 429) {
+                // Berhasil (atau error selain 429)
+                return response;
+            }
+            // Jika 429, tunggu dan coba lagi
+            const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+            console.warn(`Request failed with status 429. Retrying in ${delay / 1000}s...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+
+        } catch (error) {
+            if (attempt < maxRetries - 1) {
+                const delay = Math.pow(2, attempt) * 1000;
+                console.error(`Network error on attempt ${attempt + 1}. Retrying...`, error);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                // Gagal setelah semua percobaan
+                throw error;
+            }
+        }
+    }
+    throw new Error("Maximum retries reached.");
+}
+
+
+// --- Komponen Pembantu UI/UX ---
+const CustomFileInput = ({ label, id, onChange, maxFiles = 1, preview, multiple = false, modelDescription, onModelDescriptionChange, onDelete }) => (
+    <div className="flex flex-col space-y-2 p-4 bg-gray-100/80 rounded-xl border border-gray-300/50 shadow-lg transition duration-300 hover:border-emerald-400">
+        <label htmlFor={id} className="text-sm font-semibold text-gray-800">
+            {label}
+        </label>
+        
+        <div className="flex items-center space-x-3">
+            <label htmlFor={id} className="cursor-pointer bg-emerald-600/70 hover:bg-emerald-500 text-white font-medium py-2 px-4 rounded-lg transition duration-300 shadow-md shadow-emerald-700/30 flex items-center">
+                <Upload className="w-4 h-4 mr-2" />
+                Pilih File {multiple && (Array.isArray(preview) && preview.length > 0 ? `(${preview.length}/${maxFiles})` : '')}
+            </label>
+            <input
+                id={id}
+                type="file"
+                accept=".jpg,.jpeg,.png"
+                multiple={multiple}
+                onChange={onChange}
+                className="hidden"
+            />
+        </div>
+
+        {preview && (Array.isArray(preview) ? preview : [preview]).filter(Boolean).map((src, index) => (
+            <div key={index} className="flex flex-col md:flex-row items-start md:items-center space-y-2 md:space-x-4 mt-2">
+                <div className="relative w-24 h-24 bg-gray-200 rounded-lg overflow-hidden border border-gray-400 flex-shrink-0">
+                    <img src={`data:image/jpeg;base64,${src}`} alt={`Preview ${index + 1}`} className="w-full h-full object-cover" />
+                    {onDelete && (
+                        <button
+                            type="button"
+                            onClick={() => onDelete(index)} // Kirim index
+                            className="absolute top-1 right-1 bg-red-600/80 hover:bg-red-500 text-white p-1 rounded-full shadow-md transition duration-200 z-10"
+                            aria-label="Hapus gambar"
+                        >
+                            <X className="w-3 h-3" />
+                        </button>
+                    )}
+                </div>
+                {onModelDescriptionChange && (
+                    <div className="w-full">
+                         <label htmlFor={`model-desc-${index}`} className="text-xs font-medium text-gray-600 block mb-1">
+                            Deskripsi Model {index + 1} (Opsional)
+                        </label>
+                        <textarea
+                            id={`model-desc-${index}`}
+                            rows="2"
+                            value={(modelDescription && modelDescription[index]) || ''}
+                            onChange={(e) => onModelDescriptionChange(index, e.target.value)}
+                            placeholder="Contoh: perempuan berhijab formal, celana jeans biru, sepatu heels putih."
+                            className="w-full p-2 text-sm text-gray-900 bg-white/80 rounded-lg border border-gray-400 focus:ring-emerald-400 focus:border-emerald-400 resize-none transition duration-200"
+                        />
+                    </div>
+                )}
+            </div>
+        ))}
+        {onModelDescriptionChange && Array.isArray(preview) && preview.length < maxFiles && (
+             <button
+                type="button"
+                onClick={() => document.getElementById(id).click()}
+                className="text-emerald-600 hover:text-emerald-500 text-sm font-medium transition duration-200 mt-2 text-left flex items-center"
+            >
+                <span className="text-xl mr-1">+</span> Tambah Model ({preview.length}/{maxFiles})
+            </button>
+        )}
+    </div>
+);
+
+// --- Data Konfigurasi UNTUK IMAGE GENERATOR ---
+const RATIO_OPTIONS = [
+    { key: '9:16', label: 'PORTRAIT (9:16)', ratio: { width: 9, height: 16 } },
+    { key: '1:1', label: 'SQUARE (1:1)', ratio: { width: 1, height: 1 } },
+    { key: '16:9', label: 'LANDSCAPE (16:9)', ratio: { width: 16, height: 9 } },
+];
+const LANGUAGE_OPTIONS = ['Indonesia', 'English', 'Sunda', 'Jawa', 'Melayu', 'Arab'];
+const CAMERA_ANGLES = [
+    'Eye-Level Angle',
+    'High Angle',
+    'Low Angle',
+    'Dutch Angle (Tilted Angle)',
+    'Bird’s Eye / Top Angle'
+];
+const PROMPT_TEMPLATES = {
+    'B-Roll': [
+        { title: "B-Roll: Detail Makro", text: `B-Roll. Foto makro super detail dari produk referensi, menonjolkan tekstur dan detail terkecilnya. Gunakan pencahayaan studio yang tajam untuk menyorot kualitas produk. Latar belakang netral. Pastikan produk terlihat identik dengan referensi.`}, 
+        { title: "B-Roll: Flat Lay Minimalis", text: `B-Roll. Foto produk referensi dari sudut pandang atas (top-down view) dengan gaya flat lay minimalis. Produk menjadi pusat perhatian. Pencahayaan lembut dan merata. Pastikan produk terlihat identik dengan referensi.`}, 
+        { title: "B-Roll: Adegan Dinamis", text: `B-Roll. Foto produk referensi dalam sebuah adegan dinamis. Jika makanan, tunjukkan remah-remah di sekitarnya. Jika minuman, tunjukkan percikan. Tampilkan produk seolah-olah baru saja digunakan. Pastikan produk terlihat identik dengan referensi.`}, 
+        { title: "B-Roll: Alami dengan Properti", text: `B-Roll. Foto produk referensi diletakkan secara alami di atas permukaan yang relevan. Tambahkan satu properti sederhana yang tidak mencuri fokus. Efek depth of field (bokeh) pada latar belakang. Pastikan produk terlihat identik dengan referensi.`} 
+    ],
+    'UGC': [
+        { title: "UGC: Kasual", text: `UGC. Replikasi model dari foto referensi, pastikan wajah SANGAT IDENTIK. Gaya foto seperti hasil jepretan kamera mirrorless Sony full frame dengan detail ultra-realistis dan pencahayaan sinematik. Dia sedang menggunakan produk referensi dengan pose kasual.`}, 
+        { title: "UGC: Bersemangat", text: `UGC. Replikasi model dari foto referensi, pastikan wajah SANGAT IDENTIK. Gaya foto seperti hasil jepretan kamera mirrorless Sony full frame dengan detail ultra-realistis dan pencahayaan sinematik. Dia sedang menggunakan produk referensi dengan pose bersemangat.`}, 
+        { title: "UGC: Santai", text: `UGC. Replikasi model dari foto referensi, pastikan wajah SANGAT IDENTIK. Gaya foto seperti hasil jepretan kamera mirrorless Sony full frame dengan detail ultra-realistis dan pencahayaan sinematik. Dia sedang menggunakan produk referensi dengan pose santai.`}, 
+        { title: "UGC: Sudut Berbeda", text: `UGC. Replikasi model dari foto referensi, pastikan wajah SANGAT IDENTIK. Gaya foto seperti hasil jepretan kamera mirrorless Sony full frame dengan detail ultra-realistis dan pencahayaan sinematik. Dia sedang menggunakan produk referensi, diambil dari sudut berbeda.`} 
+    ],
+    'PHOTO PRODUK': [
+        { title: "Produk: Detail Tekstur Makro", text: `Foto detail produk. Ultra-makro close-up pada tekstur dan material dari produk referensi. Pencahayaan studio tajam menyorot jahitan/permukaan. Tanpa model. Pastikan produk identik.`}, 
+        { title: "Produk: Fokus Fitur Spesifik", text: `Foto detail produk. Fokus close-up pada satu fitur spesifik dari produk referensi (seperti logo, kancing, atau pola unik). Latar belakang bokeh/netral. Tanpa model. Pastikan produk identik.`}, 
+        { title: "Produk: Detail Sudut Sinematik", text: `Foto detail produk. Close-up sinematik dari sudut samping atau sudut unik produk referensi, menunjukkan bentuk dan desainnya. Pencahayaan dramatis. Tanpa model. Pastikan produk identik.`}, 
+        { title: "Produk: Detail Komponen Terisolasi", text: `Foto detail produk. Bidikan 'component shot' yang terisolasi, menyorot satu bagian penting dari produk referensi. Latar belakang bersih dan minimalis. Tanpa model. Pastikan produk identik.`} 
+    ]
+};
+
+// --- DATA BARU: UNTUK VEO 3 PROMPT CRAFTER ---
+const veoPromptData = {
+    subject: { label: "1. Subjek Utama", type: 'text', placeholder: "Contoh: seekor anjing laut yang memakai topi koki" },
+    action: { label: "2. Aksi/Tindakan", type: 'text', placeholder: "Contoh: sedang memasak sup di atas perahu layar" },
+    expression: { label: "3. Ekspresi", type: 'text', placeholder: "Contoh: wajahnya bersemangat dan sedikit panik" },
+    place: { label: "4. Tempat", type: 'text', placeholder: "Contoh: di tengah badai di Laut Arktik yang beku" },
+    time: { 
+        label: "5. Waktu (Pilihan)", 
+        type: 'select', 
+        options: [
+            { value: "Bright Daylight", label: "Siang Hari yang Cerah" },
+            { value: "Golden Hour Sunset", label: "Sore Hari Emas (Golden Hour)" },
+            { value: "Foggy Misty Dawn", label: "Subuh Berkabut" },
+            { value: "Deep Night, Ambient Light", label: "Malam Hari, Cahaya Sekitar" }
+        ]
+    },
+    camera_motion: {
+        label: "6. Gerakan Kamera (EN/ID)",
+        type: 'select',
+        options: [
+            { value: "Static Shot", label: "Static Shot (Bidikan Statis)" },
+            { value: "Pan", label: "Pan (Geser Horizontal)" },
+            { value: "Tilt", label: "Tilt (Geser Vertikal)" },
+            { value: "Dolly", label: "Dolly (Maju/Mundur)" },
+            { value: "Truck", label: "Trucking (Geser Samping)" },
+            { value: "Pedestal", label: "Pedestal (Naik/Turun)" },
+            { value: "Roll", label: "Roll (Gulingan Kamera)" },
+            { value: "Zoom In", label: "Zoom In (Perbesar)" },
+            { value: "Zoom Out", label: "Zoom Out (Perkecil)" },
+            { value: "Crane Shot", label: "Crane Shot (Bidikan Derek)" },
+            { value: "3D Rotation", label: "3D Rotation (Rotasi 3D)" },
+            { value: "Handheld Camera", label: "Handheld Camera (Genggam)" },
+            { value: "Tracking Shot", label: "Tracking Shot (Bidikan Pelacakan)" }
+        ]
+    },
+    lighting: { 
+        label: "7. Pencahayaan", 
+        type: 'select', 
+        options: [
+            { value: "Dramatic Side Lighting", label: "Cahaya Samping Dramatis" },
+            { value: "Soft Natural Light", label: "Cahaya Alami yang Lembut" },
+            { value: "High-Key, Bright Lighting", label: "High-Key (Sangat Terang)" },
+            { value: "Low-Key, Dark Contrast", label: "Low-Key (Kontras Gelap)" },
+            { value: "Colored Studio Lighting", label: "Pencahayaan Studio Berwarna" }
+        ]
+    },
+    video_style: { 
+        label: "8. Gaya Video", 
+        type: 'select', 
+        options: [
+            { value: "Cinematic Photorealistic", label: "Fotorealistik Sinematik" },
+            { value: "Studio Ghibli Anime", label: "Gaya Anime Studio Ghibli" },
+            { value: "Cyberpunk Concept Art", label: "Seni Konsep Cyberpunk" },
+            { value: "Retro VHS, Film Grain", label: "Retro VHS, Berbutir" },
+            { value: "Oil Painting Style", label: "Gaya Lukisan Cat Minyak" }
+        ]
+    },
+    video_vibe: { 
+        label: "9. Suasana Video", 
+        type: 'select', 
+        options: [
+            { value: "Mysterious and Tense", label: "Misterius dan Menegangkan" },
+            { value: "Fun and Cheerful", label: "Menyenangkan dan Ceria" },
+            { value: "Melancholic and Poetic", label: "Melankolis dan Puitis" },
+            { value: "Epic and Grand", label: "Epik dan Kolosal" },
+            { value: "Calm and Serene", label: "Tenang dan Damai" }
+        ]
+    },
+    sound_music: { label: "10. Suara atau Musik", type: 'text', placeholder: "Contoh: dentuman musik orkestra atau deru ombak" },
+    dialogue: { label: "11. Kalimat yang Diucapkan", type: 'text', placeholder: "Contoh: 'Kapal ini tidak akan tenggelam!'" },
+    additional_details: { label: "12. Detail Tambahan", type: 'text', placeholder: "Contoh: fokus tajam pada mata anjing laut, efek percikan air, resolusi 8K" }
+};
+// --- AKHIR DATA VEO 3 ---
+
+// --- BAGIAN BARU: Komponen Veo 3 Prompt Crafter ---
+const VeoPromptCrafter = () => {
+    // State untuk 12 input
+    const [inputs, setInputs] = useState({});
+    // State untuk output
+    const [promptId, setPromptId] = useState('');
+    const [promptEn, setPromptEn] = useState('');
+    // State untuk loading & notifikasi
+    const [isGenerating, setIsGenerating] = useState(false);
+    const [copyStatus, setCopyStatus] = useState('');
+
+    // Handler untuk memperbarui state input
+    const handleInputChange = (key, value) => {
+        setInputs(prev => ({ ...prev, [key]: value }));
+        // Hapus status salin jika input berubah
+        setCopyStatus('');
+    };
+
+    // Fungsi Logika (diadaptasi dari JS Anda)
+    const assembleIndonesianPrompt = (values) => {
+        const subject = values.subject || "Subjek";
+        const action = values.action || "melakukan suatu aksi";
+        const expression = values.expression ? `, dengan ekspresi ${values.expression}` : "";
+        const place = values.place ? ` ${values.place}` : "";
+        const time = values.time ? ` (${veoPromptData.time.options.find(o => o.value === values.time)?.label || values.time})` : "";
+        
+        let core = `${subject} ${action}${expression}${place}.`;
+        
+        let details = "\n\nDetail Teknis:";
+        details += `\n- Waktu: ${time}`;
+        details += `\n- Gerakan Kamera: ${veoPromptData.camera_motion.options.find(o => o.value === values.camera_motion)?.label || values.camera_motion || 'Tidak Ditentukan'}`;
+        details += `\n- Pencahayaan: ${veoPromptData.lighting.options.find(o => o.value === values.lighting)?.label || values.lighting || 'Tidak Ditentukan'}`;
+        details += `\n- Gaya Video: ${veoPromptData.video_style.options.find(o => o.value === values.video_style)?.label || values.video_style || 'Tidak Ditentukan'}`;
+        details += `\n- Suasana: ${veoPromptData.video_vibe.options.find(o => o.value === values.video_vibe)?.label || values.video_vibe || 'Tidak Ditentukan'}`;
+
+        let soundAndDialogue = "";
+        if (values.sound_music) {
+            soundAndDialogue += `\n\nSuara/Musik: ${values.sound_music}.`;
+        }
+        if (values.dialogue) {
+            soundAndDialogue += `\n\nKalimat yang Diucapkan: "${values.dialogue}".`;
+        }
+
+        let additional = "";
+        if (values.additional_details) {
+            additional += `\n\nDetail Tambahan: ${values.additional_details}.`;
+        }
+
+        return core + details + soundAndDialogue + additional;
+    };
+    
+    // Fungsi Logika (diadaptasi dari JS Anda)
+    const assembleEnglishPrompt = (values, indonesianText) => {
+        const core = [
+            values.subject, 
+            values.action, 
+            values.place
+        ].filter(v => v && v.length > 0).join(' '); // Pastikan v ada sebelum cek length
+
+        let modifiers = [];
+
+        if (values.expression) {
+            modifiers.push(`with an ${values.expression} expression`);
+        }
+
+        if (values.time) modifiers.push(values.time);
+        if (values.lighting) modifiers.push(values.lighting);
+        if (values.video_style) modifiers.push(values.video_style);
+        if (values.video_vibe) modifiers.push(values.video_vibe);
+        if (values.camera_motion) modifiers.push(values.camera_motion);
+        if (values.additional_details) modifiers.push(values.additional_details);
+        
+        modifiers.push("highly detailed, cinematic, high quality, 8K");
+
+        let finalPrompt = core;
+
+        if (modifiers.length > 0) {
+            finalPrompt += ', ' + modifiers.join(', ');
+        }
+
+        let soundAndDialogueEN = "";
+        if (values.sound_music) {
+            soundAndDialogueEN += ` (Sound Design: ${values.sound_music})`;
+        }
+        if (values.dialogue) {
+            soundAndDialogueEN += ` (Dialogue: "${values.dialogue}")`;
+        }
+        
+        return finalPrompt.trim().replace(/\s*,\s*,/g, ', ').replace(/, \./g, '. ') + soundAndDialogueEN;
+    };
+
+    // Handler Tombol Generate
+    const handleGenerate = () => {
+        setCopyStatus('');
+        if (!inputs.subject && !inputs.action) {
+            setPromptId("Harap isi minimal Subjek Utama atau Aksi/Tindakan.");
+            setPromptEn("");
+            return;
+        }
+
+        setIsGenerating(true);
+        setTimeout(() => {
+            const promptId = assembleIndonesianPrompt(inputs);
+            const promptEn = assembleEnglishPrompt(inputs, promptId);
+
+            setPromptId(promptId);
+            setPromptEn(promptEn);
+            setIsGenerating(false);
+            
+            // Langsung salin hasil awal
+            copyToClipboard(promptEn);
+            setCopyStatus("✅ Prompt Inggris Berhasil Disalin!");
+            setTimeout(() => setCopyStatus(''), 3000);
+
+        }, 200);
+    };
+
+    // Handler Tombol Update & Salin
+    const handleUpdateAndCopy = () => {
+        // Catatan: Dalam versi ini, kami mengasumsikan pengguna mengedit teks ID
+        // dan kami menerjemahkannya lagi.
+        // Untuk kesederhanaan (tanpa API terjemahan), kita akan
+        // MENGABAIKAN editan di kotak ID dan hanya membuat ulang + menyalin EN
+        
+        // Pilihan 1: Buat ulang berdasarkan INPUT
+        // const newPromptEn = assembleEnglishPrompt(inputs, promptId);
+        
+        // Pilihan 2: Salin apa yang ada di kotak EN (sesuai JS asli Anda)
+        const newPromptEn = promptEn;
+        
+        // Pilihan 3: Buat ulang EN berdasarkan ID yang diedit (TIDAK MUNGKIN TANPA LLM)
+        
+        // Kita gunakan Pilihan 2 (di-update Pilihan 1 untuk konsistensi)
+        const values = inputs;
+        const newPromptId = promptId; // Ambil dari state
+        const newPromptEnFromInputs = assembleEnglishPrompt(values, newPromptId);
+
+        setPromptEn(newPromptEnFromInputs); // Update kotak EN
+        copyToClipboard(newPromptEnFromInputs); // Salin
+        setCopyStatus("✅ Prompt Inggris (di-update) Berhasil Disalin!");
+        setTimeout(() => setCopyStatus(''), 3000);
+    };
+
+    return (
+        <div className="max-w-6xl mx-auto">
+            {/* Header DIHAPUS DARI SINI */}
+            
+            {/* Generator Card (Input) */}
+            <div className="p-6 bg-gray-100/80 rounded-2xl shadow-xl border border-gray-300/50 backdrop-blur-sm mb-8">
+                <h2 className="text-2xl font-semibold mb-4 text-emerald-600 border-b border-gray-300/50 pb-2">
+                    Input Komponen Prompt (12 Poin)
+                </h2>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {Object.keys(veoPromptData).map(key => {
+                        const data = veoPromptData[key];
+                        return (
+                            <div key={key} className="flex flex-col space-y-2">
+                                <label htmlFor={key} className="text-sm font-semibold text-gray-800">
+                                    {data.label}
+                                </label>
+                                
+                                {data.type === 'text' ? (
+                                    <input
+                                        type="text"
+                                        id={key}
+                                        name={key}
+                                        placeholder={data.placeholder}
+                                        value={inputs[key] || ''}
+                                        onChange={(e) => handleInputChange(key, e.target.value)}
+                                        className="w-full p-3 text-sm text-gray-900 bg-white/80 rounded-lg border border-gray-400 focus:ring-emerald-400 focus:border-emerald-400 transition duration-200"
+                                    />
+                                ) : ( // type 'select'
+                                    <select
+                                        id={key}
+                                        name={key}
+                                        value={inputs[key] || ''}
+                                        onChange={(e) => handleInputChange(key, e.target.value)}
+                                        className="w-full p-3 text-sm text-gray-900 bg-white/80 rounded-lg border border-gray-400 focus:ring-emerald-400 focus:border-emerald-400 transition duration-200 appearance-none cursor-pointer"
+                                    >
+                                        <option value="">--- Pilih Opsi ---</option>
+                                        {data.options.map(option => (
+                                            <option key={option.value} value={option.value}>
+                                                {option.label}
+                                            </option>
+                                        ))}
+                                    </select>
+                                )}
+                            </div>
+                        );
+                    })}
+                </div>
+
+                <div className="mt-8">
+                    <button
+                        onClick={handleGenerate}
+                        disabled={isGenerating}
+                        className={`w-full text-white font-bold py-3 px-6 rounded-xl transition duration-300 ease-in-out shadow-lg flex justify-center items-center 
+                            ${isGenerating
+                                ? 'bg-gray-400 cursor-not-allowed text-gray-700' 
+                                : 'bg-emerald-600 hover:bg-emerald-500 hover:shadow-[0_0_20px_rgba(52,211,153,0.7)] shadow-emerald-900/50'
+                            }`}
+                    >
+                        {isGenerating ? (
+                            <>
+                                <Loader2 className="loader w-5 h-5 mr-2 animate-spin text-white" />
+                                Processing...
+                            </>
+                        ) : (
+                            'Generate Prompt Awal'
+                        )}
+                    </button>
+                </div>
+            </div>
+
+            {/* Output Card */}
+            <div className="p-6 bg-gray-100/80 rounded-2xl shadow-xl border border-gray-300/50 backdrop-blur-sm">
+                <h2 className="text-2xl font-semibold mb-4 text-purple-600 border-b border-gray-300/50 pb-2">
+                    Prompt Hasil & Finalisasi
+                </h2>
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Indonesian Prompt (Editable) */}
+                    <div>
+                        <label htmlFor="output-prompt-id" className="text-lg font-medium text-gray-800">
+                            Prompt Bahasa Indonesia (Edit & Kembangkan)
+                        </label>
+                        <textarea
+                            id="output-prompt-id"
+                            rows="8"
+                            value={promptId}
+                            onChange={(e) => setPromptId(e.target.value)}
+                            className="w-full mt-2 p-4 text-sm text-gray-900 bg-white/80 rounded-lg border-2 border-dashed border-gray-400 focus:ring-emerald-400 focus:border-emerald-400 whitespace-pre-wrap resize-vertical"
+                        ></textarea>
+                        <p className="text-sm text-gray-500 mt-1">
+                            Anda bisa mengedit teks ini (tetapi tidak akan memengaruhi hasil EN secara otomatis).
+                        </p>
+                    </div>
+
+                    {/* English Prompt (Final, Read-Only) */}
+                    <div>
+                        <label htmlFor="output-prompt-en" className="text-lg font-medium text-gray-800">
+                            Prompt Bahasa Inggris (Final untuk Model)
+                        </label>
+                        <textarea
+                            id="output-prompt-en"
+                            rows="8"
+                            readOnly
+                            value={promptEn}
+                            className="w-full mt-2 p-4 text-sm text-gray-900 bg-gray-200/80 rounded-lg border-2 border-dashed border-purple-600 whitespace-pre-wrap resize-vertical opacity-80 cursor-not-allowed"
+                        ></textarea>
+                        <p className="text-sm text-gray-500 mt-1">
+                            Ini adalah hasil akhir yang siap disalin.
+                        </p>
+                    </div>
+                </div>
+
+                <div className="mt-4 flex flex-col sm:flex-row items-center space-y-3 sm:space-y-0 sm:space-x-4">
+                    <button
+                        onClick={handleUpdateAndCopy}
+                        disabled={!promptId || isGenerating}
+                        className="bg-purple-600 hover:bg-purple-700 text-white font-semibold py-2 px-4 rounded-lg shadow-md transition w-full sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                        Update & Salin Prompt Bahasa Inggris
+                    </button>
+                    {copyStatus && (
+                        <div className="text-emerald-600 font-medium">
+                            {copyStatus}
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+// --- AKHIR KOMPONEN VEO 3 ---
+
+// --- BAGIAN BARU: Komponen TTS Generator ---
+const TTSGenerator = () => {
+    // Data Suara (dari JS Anda)
+    const VOICE_DATA = [
+        { name: "Achernar", gender: "Wanita", style: "Narator", description: "Lembut, Halus" },
+        { name: "Charon", gender: "Pria", style: "Narator", description: "Informatif, Stabil" },
+        { name: "Erinome", gender: "Wanita", style: "Pendidik", description: "Jelas, Bersih" },
+        { name: "Iapetus", gender: "Pria", style: "Pendidik", description: "Jelas, Berwibawa" },
+        { name: "Kore", gender: "Pria", style: "Meyakinkan", description: "Tegas, Profesional" },
+        { name: "Sulafat", gender: "Netral", style: "Meyakinkan", description: "Hangat, Ramah" },
+        { name: "Puck", gender: "Wanita", style: "Pelatih", description: "Upbeat, Semangat" },
+        { name: "Zephyr", gender: "Netral", style: "Pelatih", description: "Energik, Cerah" },
+        { name: "Sadachbia", gender: "Wanita", style: "Motivator", description: "Bersemangat, Hidup" },
+        { name: "Fenrir", gender: "Pria", style: "Motivator", description: "Penuh Gairah, Semangat" },
+        { name: "Vindemiatrix", gender: "Wanita", style: "Ekspresif", description: "Lembut, Menarik, Drama" },
+        { name: "Algenib", gender: "Pria", style: "Ekspresif", description: "Serak, Dalam, Drama" },
+    ];
+    const SAMPLE_RATE = 24000;
+    const GENDER_FILTERS = ['Semua', 'Laki-laki', 'Perempuan', 'Netral'];
+    const GENDER_MAP = { 'Laki-laki': 'Pria', 'Perempuan': 'Wanita', 'Netral': 'Netral', 'Semua': 'Semua' };
+    const STYLE_FILTERS = ['Semua', 'Narator', 'Pendidik/Pengajar', 'Meyakinkan/Profesional', 'Pelatih/Ceria', 'Motivator', 'Ekspresif secara Emosional'];
+    const STYLE_MAP = {
+        'Pendidik/Pengajar': 'Pendidik',
+        'Meyakinkan/Profesional': 'Meyakinkan',
+        'Pelatih/Ceria': 'Pelatih',
+        'Ekspresif secara Emosional': 'Ekspresif',
+        'Semua': 'Semua',
+        'Narator': 'Narator',
+        'Motivator': 'Motivator'
+    };
+
+    // State
+    const [activeGenderFilter, setActiveGenderFilter] = useState('Semua');
+    const [activeStyleFilter, setActiveStyleFilter] = useState('Semua');
+    const [selectedVoice, setSelectedVoice] = useState(VOICE_DATA[0].name);
+    const [textInput, setTextInput] = useState("Selamat datang! Mari kita dengarkan suara Kore yang tegas. Ingat, gunakan koma untuk jeda, dan tanda seru untuk penekanan!");
+    const [charCount, setCharCount] = useState(0);
+    const [isLoading, setIsLoading] = useState(false);
+    const [audioUrl, setAudioUrl] = useState(null);
+    const [errorMessage, setErrorMessage] = useState(null);
+    const [notificationMessage, setNotificationMessage] = useState(null);
+
+    // Update character count
+    useEffect(() => {
+        setCharCount(textInput.length);
+    }, [textInput]);
+
+    // Logika untuk memfilter suara (menggantikan filterVoices() dari JS)
+    const filteredVoices = useMemo(() => {
+        const mappedGender = GENDER_MAP[activeGenderFilter];
+        const mappedStyle = STYLE_MAP[activeStyleFilter];
+
+        const voices = VOICE_DATA.filter(voice => {
+            const genderMatch = mappedGender === 'Semua' || voice.gender === mappedGender;
+            const styleMatch = mappedStyle === 'Semua' || voice.style === mappedStyle;
+            return genderMatch && styleMatch;
+        });
+
+        // Jika tidak ada hasil, kembalikan array kosong
+        if (voices.length === 0) {
+            return [];
+        }
+
+        return voices;
+    }, [activeGenderFilter, activeStyleFilter]);
+
+    // Update selectedVoice saat filter berubah
+    useEffect(() => {
+        if (filteredVoices.length > 0) {
+            // Cek apakah suara yang dipilih saat ini MASIH ada di daftar
+            const currentVoiceStillExists = filteredVoices.some(v => v.name === selectedVoice);
+            // Jika tidak, set ke yang pertama di daftar
+            if (!currentVoiceStillExists) {
+                setSelectedVoice(filteredVoices[0].name);
+            }
+        } else {
+            // Tidak ada suara, kosongkan pilihan
+            setSelectedVoice(null);
+        }
+    }, [filteredVoices, selectedVoice]);
+
+    // Tombol Filter
+    const FilterButton = ({ filter, label, activeFilter, setFilter }) => (
+        <button
+            onClick={() => setFilter(filter)}
+            className={`btn-filter px-4 py-2 text-sm rounded-full ${activeFilter === filter ? 'active' : ''}`}
+        >
+            {label}
+        </button>
+    );
+
+    // Handler Generate Suara
+    const handleGenerateVoiceOver = async () => {
+        // Reset UI
+        setErrorMessage(null);
+        setNotificationMessage(null);
+        setAudioUrl(null); // Sembunyikan pemutar lama
+
+        // Validasi
+        if (!selectedVoice) {
+            setNotificationMessage('Harap pilih suara yang tersedia.');
+            return;
+        }
+        if (textInput.trim().length === 0) {
+            setNotificationMessage('Harap masukkan teks yang ingin Anda ubah menjadi suara.');
+            return;
+        }
+
+        // Atur status loading
+        setIsLoading(true);
+
+        try {
+            const payload = {
+                contents: [{
+                    parts: [{ text: textInput.trim() }]
+                }],
+                generationConfig: {
+                    responseModalities: ["AUDIO"],
+                    speechConfig: {
+                        voiceConfig: {
+                            prebuiltVoiceConfig: { voiceName: selectedVoice }
+                        }
+                    }
+                },
+                model: TTS_API_MODEL
+            };
+
+            const response = await exponentialBackoffFetch(TTS_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.json();
+                console.error("API Error Response:", errorBody);
+                throw new Error(`API gagal: ${response.status} - ${errorBody.error?.message || 'Kesalahan Server'}`);
+            }
+
+            const result = await response.json();
+            const audioPart = result.candidates?.[0]?.content?.parts?.find(p => p.inlineData && p.inlineData.mimeType.startsWith("audio/L16"));
+
+            if (!audioPart || !audioPart.inlineData || !audioPart.inlineData.data) {
+                throw new Error("Respons API tidak mengandung data audio yang valid.");
+            }
+
+            const audioData = audioPart.inlineData.data;
+
+            // Konversi dan putar audio
+            const pcmBuffer = base64ToArrayBuffer(audioData);
+            const pcm16 = new Int16Array(pcmBuffer);
+            const wavBlob = pcmToWav(pcm16, SAMPLE_RATE);
+            const newAudioUrl = URL.createObjectURL(wavBlob);
+
+            setAudioUrl(newAudioUrl);
+
+        } catch (error) {
+            console.error('Kesalahan saat membuat voice over:', error);
+            setErrorMessage(`Gagal membuat suara. Detail: ${error.message}`);
+        } finally {
+            // Reset status loading
+            setIsLoading(false);
+        }
+    };
+
+    return (
+        <div className="max-w-6xl mx-auto">
+            {/* Menggunakan layout card yang konsisten dengan halaman lain */}
+            <div className="p-6 bg-gray-100/80 rounded-2xl shadow-xl border border-gray-300/50 backdrop-blur-sm mb-8">
+                
+                <h2 className="text-2xl font-semibold mb-4 text-emerald-600 border-b border-gray-300/50 pb-2 flex items-center">
+                    <Mic className="w-6 h-6 mr-2" />
+                    Generator Teks-ke-Suara (Gemini TTS)
+                </h2>
+
+                {/* Tips Kontrol Suara (diadaptasi) */}
+                <div className="bg-blue-100/70 border-l-4 border-blue-400 p-3 mb-6 rounded-lg text-sm text-blue-800">
+                    <p className="font-semibold mb-1">Tips Kontrol Suara (Nada, Intonasi, Tempo):</p>
+                    <ul className="list-disc list-inside space-y-0.5 text-xs">
+                        <li>Karakteristik teknis dikontrol melalui teks Anda (tanda baca, pemilihan kata) dan karakteristik bawaan dari setiap suara.</li>
+                        <li>Gunakan koma (,) untuk jeda singkat dan tanda seru (!) untuk penekanan.</li>
+                    </ul>
+                </div>
+
+                {/* 1. Filter Gender */}
+                <div className="mb-4">
+                    <label className="block text-sm font-semibold text-gray-800 mb-2">Gender:</label>
+                    <div className="flex flex-wrap gap-2">
+                        {GENDER_FILTERS.map(filter => (
+                            <FilterButton key={filter} filter={filter} label={filter} activeFilter={activeGenderFilter} setFilter={setActiveGenderFilter} />
+                        ))}
+                    </div>
+                </div>
+
+                {/* 2. Filter Gaya Karakter */}
+                <div className="mb-6">
+                    <label className="block text-sm font-semibold text-gray-800 mb-2">Karakter berdasarkan Gaya dan Kepribadian:</label>
+                    <div className="flex flex-wrap gap-2">
+                         {STYLE_FILTERS.map(filter => (
+                            <FilterButton key={filter} filter={filter} label={filter} activeFilter={activeStyleFilter} setFilter={setActiveStyleFilter} />
+                        ))}
+                    </div>
+                </div>
+
+                {/* 3. Hasil Filter dan Pilihan Suara Akhir */}
+                <div className="mb-6">
+                    <label htmlFor="voice-select" className="block text-sm font-semibold text-gray-800 mb-2">
+                        Pilihan Suara yang Tersedia (Hasil Filter):
+                    </label>
+                    <select 
+                        id="voice-select" 
+                        value={selectedVoice || ''}
+                        onChange={(e) => setSelectedVoice(e.target.value)}
+                        disabled={filteredVoices.length === 0}
+                        className="w-full p-3 text-sm text-gray-900 bg-white/80 rounded-lg border border-gray-400 focus:ring-emerald-400 focus:border-emerald-400 transition duration-200 appearance-none cursor-pointer"
+                    >
+                        {filteredVoices.length > 0 ? (
+                            filteredVoices.map(voice => (
+                                <option key={voice.name} value={voice.name}>
+                                    {`${voice.name} - ${voice.gender} (${voice.description})`}
+                                </option>
+                            ))
+                        ) : (
+                            <option value="" disabled>Tidak ada suara yang cocok dengan filter ini.</option>
+                        )}
+                    </select>
+                </div>
+
+                {/* Input Teks */}
+                <div className="mb-6">
+                    <label htmlFor="text-input-tts" className="block text-sm font-semibold text-gray-800 mb-2">
+                        Teks untuk diubah menjadi Suara:
+                    </label>
+                    <textarea 
+                        id="text-input-tts" 
+                        placeholder="Masukkan teks di sini..." 
+                        maxLength="500" 
+                        value={textInput}
+                        onChange={(e) => setTextInput(e.target.value)}
+                        className="w-full p-4 border border-gray-400 rounded-lg focus:ring-emerald-400 focus:border-emerald-400 transition duration-150 ease-in-out min-h-[120px] resize-vertical bg-white/80" 
+                        required
+                    ></textarea>
+                    <p className="text-xs text-gray-500 mt-1 text-right">{charCount}/500 karakter</p>
+                </div>
+
+                {/* Notifikasi (Pengganti alert) */}
+                {notificationMessage && (
+                    <div className="p-3 mb-4 text-sm font-medium text-yellow-700 bg-yellow-100 rounded-lg border border-yellow-400">
+                        {notificationMessage}
+                    </div>
+                )}
+
+                {/* Tombol Generate */}
+                <button 
+                    id="generate-button-tts" 
+                    onClick={handleGenerateVoiceOver}
+                    disabled={isLoading || !selectedVoice}
+                    className={`btn-primary w-full flex justify-center items-center py-3 px-4 border border-transparent text-sm font-medium rounded-lg text-white transition duration-300
+                        ${isLoading || !selectedVoice 
+                            ? 'bg-gray-400 cursor-not-allowed' 
+                            : 'bg-emerald-600 hover:bg-emerald-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 shadow-lg shadow-emerald-900/50'
+                        }`}
+                >
+                    {isLoading ? (
+                        <>
+                            <Loader2 className="loading-spinner h-5 w-5 border-4 border-white rounded-full mr-3" />
+                            Memproses...
+                        </>
+                    ) : (
+                        "Buat Voice Over"
+                    )}
+                </button>
+
+                {/* Area Hasil Suara */}
+                {(audioUrl || errorMessage) && (
+                    <div className="mt-8 pt-4 border-t border-gray-300/50">
+                        <h2 className="text-xl font-semibold text-gray-800 mb-3">Hasil Suara:</h2>
+                        
+                        {audioUrl && (
+                            <>
+                                <audio 
+                                    id="audio-player" 
+                                    key={audioUrl} // Paksa React untuk me-load ulang audio player
+                                    controls 
+                                    src={audioUrl}
+                                    className="w-full bg-gray-200 rounded-lg shadow-md"
+                                >
+                                    Browser Anda tidak mendukung elemen audio.
+                                </audio>
+                                
+                                <a 
+                                    id="download-button" 
+                                    href={audioUrl} 
+                                    download="voice-over.wav" 
+                                    className="btn-primary mt-4 w-full flex justify-center items-center py-2 px-4 border border-transparent text-sm font-medium rounded-lg text-white bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500"
+                                >
+                                    Download Suara (.wav)
+                                </a>
+                            </>
+                        )}
+                        
+                        {errorMessage && (
+                            <p className="text-sm text-red-600 mt-2 p-3 bg-red-100 border border-red-400 rounded-lg">
+                                {errorMessage}
+                            </p>
+                        )}
+                    </div>
+                )}
+
+            </div>
+        </div>
+    );
+};
+// --- AKHIR KOMPONEN TTS ---
+
+
+// --- BAGIAN BARU: Komponen RAHYANG IMAGE GENERATOR (Aplikasi Lama Anda) ---
+const ImageGeneratorUI = () => {
+    const [productImageBase64, setProductImageBase64] = useState([]); // Diubah menjadi array
+    const [productDescription, setProductDescription] = useState(''); // Mengosongkan default
+    
+    const [modelImageBase64, setModelImageBase64] = useState([]);
+    const [modelDescriptions, setModelDescriptions] = useState([]);
+    
+    const [selectedRatio, setSelectedRatio] = useState(RATIO_OPTIONS[0].key);
+    const [selectedLanguage, setSelectedLanguage] = useState(LANGUAGE_OPTIONS[0]);
+
+    const [isLoading, setIsLoading] = useState(false);
+    const [results, setResults] = useState({
+        'B-Roll': Array(4).fill(null),
+        'UGC': Array(4).fill(null),
+        'PHOTO PRODUK': Array(4).fill(null),
+    });
+    const [finalPrompts, setFinalPrompts] = useState([]); // Array untuk menyimpan semua final prompt
+    const [error, setError] = useState(null);
+
+    // State untuk Video Prompts (Skenario/Dialog)
+    const initialVideoPromptState = {
+        'B-Roll': Array(4).fill(null),
+        'UGC': Array(4).fill(null),
+        'PHOTO PRODUK': Array(4).fill(null),
+    };
+    const [videoPrompts, setVideoPrompts] = useState(initialVideoPromptState);
+    const [videoPromptLoading, setVideoPromptLoading] = useState(initialVideoPromptState); // true/false instead of null
+
+    // State untuk Cinematic Prompts (TTI Deskriptif)
+    const initialCinematicPromptState = {
+        'B-Roll': Array(4).fill(null),
+        'UGC': Array(4).fill(null),
+        'PHOTO PRODUK': Array(4).fill(null),
+    };
+    const [cinematicPrompts, setCinematicPrompts] = useState(initialCinematicPromptState);
+    const [cinematicPromptLoading, setCinematicPromptLoading] = useState(initialCinematicPromptState);
+
+    // State untuk Edit Angle
+    const [openEditMenu, setOpenEditMenu] = useState(null); // Menyimpan key item yg dibuka, cth: "UGC-1"
+    const [editedImages, setEditedImages] = useState({}); // Menyimpan hasil edit, cth: {"UGC-1-High Angle": base64}
+    const [editLoading, setEditLoading] = useState(null); // Menyimpan key edit yg loading, cth: "UGC-1-High Angle"
+    
+    // State untuk Re-generate Tunggal
+    const [regeneratingKey, setRegeneratingKey] = useState(null); // Cth: "UGC-1"
+
+    // State untuk Lightbox/Modal (Dipindahkan ke dalam komponen ini)
+    const [isLightboxOpen, setIsLightboxOpen] = useState(false);
+    const [lightboxImageSrc, setLightboxImageSrc] = useState('');
+
+    // Handler untuk membuka Lightbox
+    const openLightbox = (imageSrc) => {
+        setLightboxImageSrc(imageSrc);
+        setIsLightboxOpen(true);
+    };
+
+    // Handler untuk menutup Lightbox
+    const closeLightbox = () => {
+        setIsLightboxOpen(false);
+        setLightboxImageSrc('');
+    };
+
+    // Handler untuk File Upload
+    const handleFileChange = async (event, setter, isMultiple = false, maxFiles = 2) => {
+        const files = Array.from(event.target.files);
+        if (files.length === 0) return;
+
+        if (isMultiple) {
+             const newFiles = files.slice(0, maxFiles);
+             const base64Promises = newFiles.map(fileToBase64);
+             const newBase64s = await Promise.all(base64Promises);
+             setter(prev => [...prev, ...newBase64s].slice(0, maxFiles));
+        } else {
+            const base64 = await fileToBase64(files[0]);
+            setter(base64);
+        }
+        setError(null);
+    };
+
+    // Handler untuk Deskripsi Model
+    const handleModelDescriptionChange = useCallback((index, value) => {
+        setModelDescriptions(prev => {
+            const newDescriptions = [...prev];
+            newDescriptions[index] = value;
+            return newDescriptions;
+        });
+    }, []);
+    
+    // Auto-sync model descriptions array length with uploaded images
+    useEffect(() => {
+        if (modelImageBase64.length !== modelDescriptions.length) {
+            setModelDescriptions(new Array(modelImageBase64.length).fill(''));
+        }
+    }, [modelImageBase64.length, modelDescriptions.length]);
+
+    // Auto-sync model descriptions array length with uploaded images
+    useEffect(() => {
+        const numImages = modelImageBase64.length;
+        const numDescs = modelDescriptions.length;
+
+        if (numImages > numDescs) {
+            // User added images
+            const newEntries = new Array(numImages - numDescs).fill('');
+            setModelDescriptions(prevDescs => [...prevDescs, ...newEntries]);
+        } else if (numImages < numDescs) {
+            // This case is handled by onDelete, but as a safety fallback:
+            setModelDescriptions(prevDescs => prevDescs.slice(0, numImages));
+        }
+    }, [modelImageBase64.length]); // Hanya perlu bergantung pada panjang array gambar
+
+    // Handler untuk Hapus Gambar Produk Utama
+    const handleDeleteProductImage = useCallback((indexToDelete) => {
+        setProductImageBase64(prev => prev.filter((_, index) => index !== indexToDelete));
+    }, []);
+
+    // Handler untuk Hapus Gambar Model
+    const handleDeleteModelImage = useCallback((indexToDelete) => {
+        setModelImageBase64(prev => prev.filter((_, index) => index !== indexToDelete));
+        setModelDescriptions(prev => prev.filter((_, index) => index !== indexToDelete));
+    }, []);
+
+    // Build Full Prompt
+    const buildFullPrompt = (baseTemplatePrompt, categoryKey) => {
+        const ratioOptions = RATIO_OPTIONS.find(o => o.key === selectedRatio);
+        const ratioKey = ratioOptions ? ratioOptions.key : '9:16';
+        const modelDescText = modelDescriptions.filter(d => d && d.trim().length > 0).join(' dan model kedua: ');
+        
+        const isProductDescriptionProvided = productDescription && productDescription.trim() !== '';
+
+        let prompt;
+
+        // Common instructions for all prompts:
+        let commonInstructions = `
+            Anda adalah pakar Image-to-Image (I2I) dan DALL-E. Tugas Anda adalah menghasilkan konten visual yang sangat detail dan realistis untuk tujuan pemasaran afiliasi.
+            
+            # ATURAN UTAMA
+            1. REPLIKASI PRODUK: Produk yang dihasilkan HARUS terlihat 100% IDENTIK dengan gambar-gambar referensi produk utama (contoh: foto depan dan belakang). Ini termasuk warna, tekstur, bentuk, logo/merek, dan detail kecil.
+            2. GAYA FOTO: Gunakan gaya fotografi komersial, ultra-realistis, dan sinematik.
+            3. RAHASIA & OUTPUT: JANGAN PERNAH mengembalikan teks atau dialog konfirmasi ("Tentu," "Baik," dll.) sebagai bagian dari respons. Fokus hanya pada payload gambar Base64.
+            4. INTRUKSI FINAL: Gambar ini akan dipotong menjadi rasio ${ratioKey}.
+            5. PENTING: Jika ada wajah manusia di gambar-gambar referensi produk utama, ABAIKAN wajah tersebut. Jangan mereplikasi atau meniru wajah dari gambar produk. Fokus hanya pada produknya.
+            6. RASIO: Pastikan aspek rasio output adalah ${ratioKey}.
+            7. PENTING (ANTI-TEKS): JANGAN PERNAH menambahkan teks, tulisan, watermark, logo yang tidak ada di referensi, atau tulisan terdistorsi apa pun ke dalam gambar. Gambar harus bersih dari teks buatan AI.
+        `;
+
+        // Logika model SEKARANG bergantung pada categoryKey
+        let modelIntegrationInstruction = '';
+        // HANYA kategori 'UGC' yang boleh menggunakan model
+        if (categoryKey === 'UGC' && modelImageBase64.length > 0) {
+            modelIntegrationInstruction = `
+                PENTING UNTUK MODEL: Replikasi model dari foto referensi. Gunakan produk dari foto-foto produk utama dan tampilkan bersama model yang dihasilkan AI. Wajah model HARUS identik dengan foto model yang diunggah secara terpisah. JANGAN meniru wajah apapun yang mungkin ada di foto-foto produk.
+            `;
+            if (modelDescText) {
+                modelIntegrationInstruction += ` Keterangan tambahan untuk model: ${modelDescText}.`;
+            }
+        } else {
+            // Untuk 'B-Roll' dan 'PHOTO PRODUK', EKSPLISIT katakan JANGAN ADA MODEL.
+            modelIntegrationInstruction = ` PENTING: Tanpa model manusia di gambar ini. Fokus hanya pada produk.`;
+        }
+        
+        // Combine template specific prompt with common and user/model specific instructions
+        prompt = `${commonInstructions}
+            
+            # KONTEKS GAMBAR:
+            - JENIS KONTEN: ${baseTemplatePrompt.title}
+            - RASIO OUTPUT: ${ratioKey}
+            - DESKRIPSI KONSEP UTAMA: ${baseTemplatePrompt.text}. ${isProductDescriptionProvided ? `Integrasikan suasana dan latar belakang berikut: "${productDescription}".` : ''}
+            
+            # DETAIL SPESIFIK:
+            ${modelIntegrationInstruction}
+            
+            PENTING: Latar belakang, suasana, dan properti foto harus sesuai dengan konteks ini.
+        `;
+
+        return prompt;
+    };
+
+
+    // Fungsi untuk memanggil Image Generation API (untuk setiap template)
+    const handleGenerate = useCallback(async () => {
+        if (productImageBase64.length === 0) {
+            setError("Harap unggah setidaknya satu Foto Produk (utama) terlebih dahulu."); 
+            return;
+        }
+
+        setIsLoading(true);
+        setResults({
+            'B-Roll': Array(4).fill(null),
+            'UGC': Array(4).fill(null),
+            'PHOTO PRODUK': Array(4).fill(null),
+        });
+        setVideoPrompts(initialVideoPromptState); 
+        setVideoPromptLoading(initialVideoPromptState); 
+        setCinematicPrompts(initialCinematicPromptState); 
+        setCinematicPromptLoading(initialCinematicPromptState); 
+        setOpenEditMenu(null);
+        setEditedImages({});
+        setEditLoading(null);
+        setRegeneratingKey(null); 
+        setFinalPrompts([]);
+        setError(null);
+
+        const allPromptsToGenerate = [];
+        for (const categoryKey in PROMPT_TEMPLATES) {
+            PROMPT_TEMPLATES[categoryKey].forEach((template, index) => {
+                allPromptsToGenerate.push({
+                    category: categoryKey,
+                    index: index,
+                    prompt: buildFullPrompt(template, categoryKey)
+                });
+            });
+        }
+        
+        let generatedPrompts = [];
+        let newResults = {
+            'B-Roll': Array(4).fill(null),
+            'UGC': Array(4).fill(null),
+            'PHOTO PRODUK': Array(4).fill(null),
+        };
+
+        for (const promptConfig of allPromptsToGenerate) {
+            generatedPrompts.push(promptConfig.prompt); // Simpan prompt untuk ditampilkan
+
+            const shouldSendModelImages = promptConfig.category === 'UGC' && modelImageBase64.length > 0;
+            
+            const imageDataParts = shouldSendModelImages
+                ? modelImageBase64.map(base64 => ({
+                    inlineData: { mimeType: 'image/jpeg', data: base64 }
+                }))
+                : [];
+                
+            const productImageDataParts = productImageBase64.map(base64 => ({
+                inlineData: { mimeType: 'image/jpeg', data: base64 }
+            }));
+
+            const contents = [{
+                parts: [
+                    { text: promptConfig.prompt },
+                    ...productImageDataParts,
+                    ...imageDataParts 
+                ]
+            }];
+            
+            const payload = {
+                contents: contents,
+                generationConfig: {
+                    responseModalities: ['TEXT', 'IMAGE']
+                },
+            };
+            
+            const maxRetries = 3;
+            let success = false;
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+                try {
+                    const response = await fetch(GENERATION_API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+
+                    const result = await response.json();
+                    const candidate = result.candidates?.[0];
+                    const base64Data = candidate?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+
+                    if (base64Data) {
+                        newResults[promptConfig.category][promptConfig.index] = base64Data;
+                        setResults({...newResults}); // Update state secara parsial untuk preview
+                        success = true;
+                        break; 
+                    } else {
+                        const textPart = candidate?.content?.parts?.find(p => p.text && !p.inlineData);
+                        const textExplanation = textPart?.text;
+                        
+                        if (textExplanation && textExplanation.trim().length > 0) {
+                            console.error(`AI returned text but no image for ${promptConfig.category}-${promptConfig.index}:`, textExplanation);
+                            throw new Error(`AI gagal menghasilkan gambar untuk ${promptConfig.category} (${promptConfig.index + 1}). Data gambar tidak ditemukan.`);
+                        } else {
+                            throw new Error(`Tidak ada data gambar yang ditemukan dalam respons API untuk ${promptConfig.category} (${promptConfig.index + 1}).`);
+                        }
+                    }
+                } catch (err) {
+                    console.error(`Attempt ${attempt + 1} for ${promptConfig.category}-${promptConfig.index} failed:`, err);
+                    if (attempt === maxRetries - 1) {
+                        setError(prev => `${prev ? prev + '\n' : ''}Gagal (${promptConfig.category} ${promptConfig.index + 1}): ${err.message}`);
+                    } else {
+                        const delay = Math.pow(2, attempt) * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                }
+            }
+        }
+        setFinalPrompts(generatedPrompts);
+        setIsLoading(false);
+    }, [productImageBase64, modelImageBase64, productDescription, modelDescriptions, selectedRatio, selectedLanguage]);
+
+
+    // --- FUNGSI: Re-generate Satu Gambar ---
+    const handleRegenerateSingle = useCallback(async (categoryKey, index, template) => {
+        const itemKey = `${categoryKey}-${index}`;
+        setRegeneratingKey(itemKey);
+        setError(null);
+
+        const prompt = buildFullPrompt(template, categoryKey);
+        
+        const shouldSendModelImages = categoryKey === 'UGC' && modelImageBase64.length > 0;
+
+        const imageDataParts = shouldSendModelImages
+            ? modelImageBase64.map(base64 => ({
+                inlineData: { mimeType: 'image/jpeg', data: base64 }
+            }))
+            : [];
+            
+        const productImageDataParts = productImageBase64.map(base64 => ({
+            inlineData: { mimeType: 'image/jpeg', data: base64 }
+        }));
+
+        const contents = [{
+            parts: [
+                { text: prompt },
+                ...productImageDataParts, 
+                ...imageDataParts
+            ]
+        }];
+        
+        const payload = {
+            contents: contents,
+            generationConfig: {
+                responseModalities: ['TEXT', 'IMAGE']
+            },
+        };
+
+        const maxRetries = 3;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const response = await fetch(GENERATION_API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const result = await response.json();
+                const candidate = result.candidates?.[0];
+                const base64Data = candidate?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+
+                if (base64Data) {
+                    setResults(prev => {
+                        const newCategoryResults = [...prev[categoryKey]];
+                        newCategoryResults[index] = base64Data;
+                        return { ...prev, [categoryKey]: newCategoryResults };
+                    });
+                    
+                    setVideoPrompts(prev => {
+                        const newState = JSON.parse(JSON.stringify(prev));
+                        newState[categoryKey][index] = null;
+                        return newState;
+                    });
+                    setCinematicPrompts(prev => {
+                        const newState = JSON.parse(JSON.stringify(prev));
+                        newState[categoryKey][index] = null;
+                        return newState;
+                    });
+                    setEditedImages(prev => {
+                        const newEdits = {...prev};
+                        CAMERA_ANGLES.forEach(angle => {
+                            delete newEdits[`${itemKey}-${angle}`];
+                        });
+                        return newEdits;
+                    });
+
+                    break; 
+                } else {
+                    throw new Error("AI gagal menghasilkan gambar (re-generate).");
+                }
+            } catch (err) {
+                console.error(`Attempt ${attempt + 1} for ${itemKey} failed:`, err);
+                if (attempt === maxRetries - 1) {
+                    setError(prev => `${prev ? prev + '\n' : ''}Gagal (Perbarui ${itemKey}): ${err.message}`);
+                } else {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+        
+        setRegeneratingKey(null); // Selesai loading
+    }, [productImageBase64, modelImageBase64, productDescription, modelDescriptions, selectedRatio, selectedLanguage]);
+
+
+    // --- FUNGSI: Generate Video Prompt (Skenario/Dialog) ---
+    const handleGenerateVideoPrompt = useCallback(async (category, index, imageBase64) => {
+        if (!imageBase64) return;
+
+        setVideoPromptLoading(prev => {
+            const newState = JSON.parse(JSON.stringify(prev)); // Deep copy
+            newState[category][index] = true;
+            return newState;
+        });
+        setError(null);
+
+        let inspirationStyle = '';
+        if (category === 'B-Roll' || category === 'PHOTO PRODUK') {
+            inspirationStyle = "- Jika Kategori 'B-Roll'/'PHOTO PRODUK' (fokus produk): \"Kaos ini Keren Banget, Bahannya Lembut dan adem , memebuat style kamu menjadi lebih keren\" atau \"Udah banyak banget kaos yang aku cobain tapi kaos dari brand ini memang yang terbaik, dan pas banget buat look aku\"";
+        } else if (category === 'UGC') {
+            inspirationStyle = "- Jika Kategori 'UGC' (ada model): \"Kaos ini bisa kalian gunakan buat hangout, ootd an. dan bisa juga buat ke acara santai loh, yuk langsung di order guys\"";
+        }
+
+        const metaPrompt = `
+            Anda adalah seorang copywriter dan sutradara video ahli untuk iklan afiliasi TikTok/Reels. Tugas Anda adalah membuat prompt video (skenario) singkat berdasarkan GAMBAR YANG DIBERIKAN.
+            
+            Konteks:
+            - Produk: ${productDescription || 'produk yang ditampilkan dalam gambar'}
+            - Kategori Gambar: ${category}
+            - Bahasa Dialog: ${selectedLanguage}
+            - Rasio Video: ${selectedRatio}
+
+            Tugas:
+            1. Analisis gambar yang diberikan (suasana, pencahayaan, gaya, apakah ada model, dll.).
+            2. Buat skenario video pendek (5-10 detik) yang cocok dengan suasana dan gaya visual gambar tersebut.
+            3. Buat **DIALOG KREATIF** yang relevan dalam bahasa ${selectedLanguage}. JANGAN gunakan dialog template statis. Dialog harus berupa ulasan (review) atau ajakan (call-to-action) yang natural dan terdengar otentik.
+
+            **Inspirasi Gaya Dialog (BUKAN untuk ditiru persis, tapi sebagai GAYA):**
+            ${inspirationStyle}
+
+            4. Dialog harus sangat relevan dengan visual di gambar.
+            
+            Format Output (HARUS TEPAT SEPERTI INI, dalam bahasa ${selectedLanguage}):
+
+            **Suasana:** [Suasana yang cocok dengan gambar, misal: 'Malam hari yang santai di kamar estetik', 'Studio yang cerah dan bersih', 'Outdoor, pencahayaan alami']
+            **Gaya Kamera:** [Gaya kamera, misal: 'Close-up sinematik pada tekstur produk', 'Medium shot, handheld (genggam) agar terlihat otentik', 'Transisi cepat (zoom in) ke produk']
+            **Dialog (Bahasa ${selectedLanguage}):** [Dialog KREATIF yang Anda buat, misal: 'Seseorang (Suara ceria): Wah, gila sih kaos ini! Bahannya adem banget...']
+        `;
+
+        const payload = {
+            contents: [{
+                parts: [
+                    { text: metaPrompt },
+                    { inlineData: { mimeType: 'image/jpeg', data: imageBase64 } }
+                ]
+            }],
+        };
+
+        try {
+            const response = await fetch(TEXT_GEN_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.text();
+                throw new Error(`HTTP error! status: ${response.status}. Body: ${errorBody}`);
+            }
+
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+            const text = candidate?.content?.parts?.[0]?.text;
+
+            if (text) {
+                setVideoPrompts(prev => {
+                    const newState = JSON.parse(JSON.stringify(prev));
+                    newState[category][index] = text;
+                    return newState;
+                });
+            } else {
+                console.error("Respons AI tidak valid:", result);
+                throw new Error("AI tidak mengembalikan teks (respons kosong atau format salah).");
+            }
+
+        } catch (err) {
+            console.error(`Gagal membuat video prompt:`, err);
+            setError(`Gagal membuat video prompt (${category} ${index + 1}): ${err.message}`);
+        } finally {
+            setVideoPromptLoading(prev => {
+                const newState = JSON.parse(JSON.stringify(prev));
+                newState[category][index] = false;
+                return newState;
+            });
+        }
+
+    }, [productDescription, selectedLanguage, selectedRatio]); // Dependencies
+
+    // --- FUNGSI: Generate Cinematic TTI Prompt ---
+    const handleGenerateCinematicPrompt = useCallback(async (category, index, imageBase64) => {
+        if (!imageBase64) return;
+
+        setCinematicPromptLoading(prev => {
+            const newState = JSON.parse(JSON.stringify(prev)); // Deep copy
+            newState[category][index] = true;
+            return newState;
+        });
+        setError(null);
+
+        const metaPrompt = `
+            Anda adalah seorang ahli 'prompt engineering' untuk model 'text-to-image' (seperti Midjourney atau DALL-E 3). Tugas Anda adalah menganalisis GAMBAR YANG DIBERIKAN dan menulis sebuah prompt deskriptif yang sangat detail untuk menciptakan kembali gambar tersebut dengan gaya sinematik.
+            
+            Instruksi:
+            1. Analisis gambar: perhatikan subjek utama (produk/model), latar belakang, pencahayaan, suasana, dan komposisi.
+            2. Buat satu paragraf prompt (bukan list) dalam bahasa Inggris (karena model TTI/TTV lebih baik dalam bahasa Inggris).
+            3. Gunakan kata kunci deskriptif dan sinematik, mirip dengan contoh ini: "Cinematic product shot of a [subject], [detail 1], [detail 2], [lighting style], [atmosphere], 4K, ultra realistic, [mood], [composition style], [photography style]"
+            4. FOKUS HANYA PADA VISUAL. Jangan membuat dialog atau skenario.
+            
+            Format Output: HANYA kembalikan teks prompt dalam satu paragraf. JANGAN tambahkan "Tentu," atau "Berikut promptnya:".
+        `;
+
+        const payload = {
+            contents: [{
+                parts: [
+                    { text: metaPrompt },
+                    { inlineData: { mimeType: 'image/jpeg', data: imageBase64 } }
+                ]
+            }],
+        };
+
+        try {
+            const response = await fetch(TEXT_GEN_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.text();
+                throw new Error(`HTTP error! status: ${response.status}. Body: ${errorBody}`);
+            }
+
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+            const text = candidate?.content?.parts?.[0]?.text;
+
+            if (text) {
+                setCinematicPrompts(prev => {
+                    const newState = JSON.parse(JSON.stringify(prev));
+                    newState[category][index] = text;
+                    return newState;
+                });
+            } else {
+                console.error("Respons AI tidak valid (cinematic):", result);
+                throw new Error("AI tidak mengembalikan teks cinematic prompt (respons kosong atau format salah).");
+            }
+
+        } catch (err) {
+            console.error(`Gagal membuat prompt cinematic:`, err);
+            setError(`Gagal membuat prompt cinematic (${category} ${index + 1}): ${err.message}`);
+        } finally {
+            setCinematicPromptLoading(prev => {
+                const newState = JSON.parse(JSON.stringify(prev));
+                newState[category][index] = false;
+                return newState;
+            });
+        }
+
+    }, []); // Dependencies (setter state tidak perlu)
+
+    // --- FUNGSI: Generate Edit Camera Angle ---
+    const handleGenerateEdit = useCallback(async (categoryKey, index, originalImageBase64, angleName) => {
+        const itemKey = `${categoryKey}-${index}`;
+        const editKey = `${itemKey}-${angleName}`;
+        
+        setEditLoading(editKey);
+        setError(null);
+
+        let specialInstruction = '';
+        if (angleName === 'Bird’s Eye / Top Angle') {
+            specialInstruction = `
+            # INSTRUKSI KHUSUS UNTUK ANGLE INI:
+            - Ambil foto dari sudut "Bird's Eye" (tepat di atas subjek, melihat ke bawah).
+            - PENTING: Model (jika ada) JANGAN melihat ke atas (ke arah kamera). Model harus tetap dalam pose aslinya, seolah-olah tidak sadar difoto dari atas. Wajah dan mata model harus tetap lurus ke depan atau sesuai pose asli.
+            `;
+        }
+
+        const editPrompt = `
+            # PERINTAH UTAMA: EDIT GAMBAR (IMAGE-TO-IMAGE)
+            Anda adalah editor foto AI. Tugas Anda adalah mengambil gambar yang ada (diberikan sebagai input) dan MENGEDITNYA.
+            JANGAN mengubah subjek, produk, atau model di dalam gambar.
+            Tugas Anda HANYA mengubah sudut pengambilan gambar (camera angle).
+
+            # EDIT YANG DIMINTA:
+            Ubah sudut kamera menjadi: "${angleName}".
+            
+            ${specialInstruction}
+
+            # ATURAN:
+            - Subjek, produk, dan model harus tetap 100% sama dengan gambar input.
+            - Gaya foto harus tetap sama dengan gambar input.
+            - Lakukan HANYA perubahan sudut kamera (dengan mematuhi instruksi khusus jika ada).
+            - JANGAN PERNAH mengembalikan teks atau dialog konfirmasi. Fokus hanya pada output gambar Base64.
+        `;
+
+        const shouldSendModelImagesForEdit = categoryKey === 'UGC' && modelImageBase64.length > 0;
+        const modelDataPartsForEdit = shouldSendModelImagesForEdit
+            ? modelImageBase64.map(base64 => ({
+                inlineData: { mimeType: 'image/jpeg', data: base64 }
+            }))
+            : [];
+
+        const productImageDataParts = productImageBase64.map(base64 => ({
+            inlineData: { mimeType: 'image/jpeg', data: base64 }
+        }));
+
+        const payload = {
+            contents: [{
+                parts: [
+                    { text: editPrompt },
+                    { inlineData: { mimeType: 'image/jpeg', data: originalImageBase64 } },
+                    ...productImageDataParts, 
+                    ...modelDataPartsForEdit
+                ]
+            }],
+            generationConfig: {
+                responseModalities: ['TEXT', 'IMAGE']
+            },
+        };
+
+        const maxRetries = 3;
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const response = await fetch(GENERATION_API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const result = await response.json();
+                const candidate = result.candidates?.[0];
+                const base64Data = candidate?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+
+                if (base64Data) {
+                    setEditedImages(prev => ({
+                        ...prev,
+                        [editKey]: base64Data
+                    }));
+                    setEditLoading(null);
+                    return; 
+                } else {
+                    throw new Error("AI gagal menghasilkan gambar editan.");
+                }
+
+            } catch (err) {
+                console.error(`Attempt ${attempt + 1} for edit ${editKey} failed:`, err);
+                if (attempt === maxRetries - 1) {
+                    setError(prev => `${prev ? prev + '\n' : ''}Gagal (Edit ${angleName}): ${err.message}`);
+                    setEditLoading(null);
+                } else {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+    }, [productImageBase64, modelImageBase64]);
+
+
+    // --- UI Render untuk Image Generator ---
+    return (
+        <>
+            {/* Header DIHAPUS DARI SINI */}
+
+            <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8">
+                
+                {/* Panel Kontrol (Form) */}
+                <div className="lg:col-span-2 space-y-6">
+                    <div className="p-6 bg-gray-100/80 rounded-2xl shadow-xl border border-gray-300/50 backdrop-blur-sm">
+                        <h2 className="text-2xl font-bold mb-4 flex items-center text-emerald-600">
+                            <Zap className="w-6 h-6 mr-2" /> Input Generator
+                        </h2>
+
+                        {/* 1. Unggah Foto Produk Utama */}
+                        <CustomFileInput
+                            id="product-upload-main"
+                            label="1. Unggah Foto Produk (utama) - Wajib (Maks 2)" 
+                            onChange={(e) => handleFileChange(e, setProductImageBase64, true, 2)} 
+                            preview={productImageBase64}
+                            onDelete={handleDeleteProductImage}
+                            multiple={true}
+                            maxFiles={2}
+                        />
+
+                        {/* 2. Deskripsi Produk & Konsep Foto */}
+                        <div className="mt-6">
+                            <label htmlFor="product-desc" className="text-sm font-semibold text-gray-800 block mb-1">
+                                2. Deskripsi Produk & Konsep Foto (Opsional)
+                            </label>
+                            <textarea
+                                id="product-desc"
+                                rows="3"
+                                value={productDescription}
+                                onChange={(e) => setProductDescription(e.target.value)}
+                                placeholder="Contoh: Kaos ini sangat bagus. Konsep foto di kamar estetik, suasana santai pada malam hari"
+                                className="w-full p-3 text-sm text-gray-900 bg-white/80 rounded-lg border border-gray-400 focus:ring-emerald-400 focus:border-emerald-400 resize-none transition duration-200"
+                            />
+                            <p className="text-xs text-gray-500 mt-1">
+                                *Jika kolom ini kosong, AI akan membuat prompt otomatis: "Model berinteraksi/menggunakan produk di lingkungan yang relevan."
+                            </p>
+                        </div>
+
+                        {/* 3. Unggah Foto Model */}
+                        <div className="mt-6">
+                            <CustomFileInput
+                                id="model-upload"
+                                label="3. Unggah Foto Model (Opsional, Max 2) - Hanya untuk UGC"
+                                onChange={(e) => handleFileChange(e, setModelImageBase64, true, 2)}
+                                preview={modelImageBase64}
+                                multiple={true}
+                                maxFiles={2}
+                                modelDescription={modelDescriptions}
+                                onModelDescriptionChange={handleModelDescriptionChange}
+                                onDelete={handleDeleteModelImage}
+                            />
+                        </div>
+
+                        {/* 4. & 5. Rasio dan Bahasa */}
+                        <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label htmlFor="ratio-select" className="text-sm font-semibold text-gray-800 block mb-1">
+                                    4. Pilih Rasio
+                                </label>
+                                <select
+                                    id="ratio-select"
+                                    value={selectedRatio}
+                                    onChange={(e) => setSelectedRatio(e.target.value)}
+                                    className="w-full p-3 text-sm text-gray-900 bg-white/80 rounded-lg border border-gray-400 focus:ring-emerald-400 focus:border-emerald-400 transition duration-200 appearance-none cursor-pointer"
+                                >
+                                    {RATIO_OPTIONS.map(option => (
+                                        <option key={option.key} value={option.key}>{option.label}</option>
+                                    ))}
+                                </select>
+
+                            </div>
+                            <div>
+                                <label htmlFor="lang-select" className="text-sm font-semibold text-gray-800 block mb-1">
+                                    5. Pilih Bahasa Output
+                                </label>
+                                <select
+                                    id="lang-select"
+                                    value={selectedLanguage}
+                                    onChange={(e) => setSelectedLanguage(e.target.value)}
+                                    className="w-full p-3 text-sm text-gray-900 bg-white/80 rounded-lg border border-gray-400 focus:ring-emerald-400 focus:border-emerald-400 transition duration-200 appearance-none cursor-pointer"
+                                >
+                                    {LANGUAGE_OPTIONS.map(lang => (
+                                        <option key={lang} value={lang}>{lang}</option>
+                                    ))}
+                                </select>
+                            </div>
+                        </div>
+
+                        {/* Tombol GENERATE tunggal */}
+                        <div className="mt-8 pt-6 border-t border-gray-300/50">
+                             <h3 className="text-xl font-bold mb-4 text-purple-600 flex items-center">
+                                <Check className="w-5 h-5 mr-2" /> Hasil Konten
+                            </h3>
+
+                            {error && (
+                                <div className="p-3 mb-4 text-sm font-medium text-red-700 bg-red-100 rounded-lg border border-red-400 whitespace-pre-wrap">
+                                    {error}
+                                </div>
+                            )}
+
+                            <button
+                                onClick={handleGenerate}
+                                className={`w-full text-white font-bold py-3 px-6 rounded-xl transition duration-300 ease-in-out shadow-lg flex justify-center items-center 
+                                    ${!productImageBase64 || productImageBase64.length === 0 || isLoading 
+                                        ? 'bg-gray-400 cursor-not-allowed text-gray-700' 
+                                        : 'bg-emerald-600 hover:bg-emerald-500 hover:shadow-[0_0_20px_rgba(52,211,153,0.7)] shadow-emerald-900/50'
+                                    }`}
+                                disabled={isLoading || !productImageBase64 || productImageBase64.length === 0}
+                            >
+                                {isLoading ? (
+                                    <>
+                                        <Loader2 className="loader w-5 h-5 mr-2 animate-spin text-white" />
+                                        AI sedang memproses konten kamu...
+                                    </>
+                                ) : (
+                                    <>
+                                        <Zap className="w-5 h-5 mr-2" />
+                                        Generate 9 Konten
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Panel Hasil (Output) */}
+                <div className="lg:col-span-1 space-y-6">
+                    <div className="sticky top-8 p-6 bg-gray-100/80 rounded-2xl shadow-xl border border-gray-300/50 backdrop-blur-sm">
+                        <h2 className="text-2xl font-bold mb-4 flex items-center text-purple-600">
+                            <Download className="w-6 h-6 mr-2" /> Hasil Generator
+                        </h2>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                            {Object.keys(PROMPT_TEMPLATES).map(categoryKey => (
+                                <React.Fragment key={categoryKey}>
+                                    <h3 className="col-span-full text-xl font-bold text-emerald-600 mt-6 mb-2">{categoryKey}</h3>
+                                    {PROMPT_TEMPLATES[categoryKey].map((template, index) => {
+                                        const itemKey = `${categoryKey}-${index}`;
+                                        const currentImageBase64 = results[categoryKey]?.[index];
+                                        const isRegenerating = regeneratingKey === itemKey;
+
+                                        return (
+                                        <div key={itemKey} className="flex flex-col items-center mb-4">
+                                            <div
+                                                className={`image-container w-full ${selectedRatio === '1:1' ? 'aspect-square' : (selectedRatio === '9:16' ? 'aspect-[9/16]' : 'aspect-[16/9]')} bg-gray-200 rounded-xl border-4 border-dashed ${isLoading || isRegenerating ? 'border-purple-500' : 'border-gray-400'} flex items-center justify-center transition-all duration-500 overflow-hidden`}
+                                            >
+                                                {isLoading ? ( // Loading Global
+                                                    <Loader2 className="loader w-8 h-8 text-purple-600" />
+                                                ) : isRegenerating ? ( // Loading Tunggal
+                                                    <Loader2 className="loader w-8 h-8 text-purple-600" />
+                                                ) : currentImageBase64 ? (
+                                                    <>
+                                                        <img
+                                                            src={`data:image/jpeg;base64,${currentImageBase64}`}
+                                                            alt={`${categoryKey} ${index + 1}`}
+                                                            className="w-full h-full object-cover"
+                                                        />
+                                                        {/* Overlay */}
+                                                        <div className="image-overlay !flex-col !items-center !justify-center !p-2 !space-y-2">
+                                                            
+                                                            <div className="flex flex-row space-x-2">
+                                                                <button
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation(); 
+                                                                        openLightbox(`data:image/jpeg;base64,${currentImageBase64}`);
+                                                                    }}
+                                                                    className="overlay-button view !p-2 !m-0"
+                                                                    title="Lihat Gambar"
+                                                                >
+                                                                    <Image className="w-5 h-5" />
+                                                                </button>
+                                                                
+                                                                <button
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation(); 
+                                                                        downloadImage(
+                                                                            currentImageBase64, 
+                                                                            `rahayng_${categoryKey.toLowerCase()}_${index + 1}_${selectedRatio.replace(':', 'x')}.jpg`
+                                                                        );
+                                                                    }}
+                                                                    className="overlay-button download !p-2 !m-0"
+                                                                    title="Unduh Gambar"
+                                                                >
+                                                                    <Download className="w-5 h-5" />
+                                                                </button>
+                                                            </div>
+                                                            
+                                                            <button
+                                                                onClick={(e) => {
+                                                                    e.stopPropagation();
+                                                                    if (!isRegenerating) {
+                                                                        handleRegenerateSingle(categoryKey, index, template);
+                                                                    }
+                                                                }}
+                                                                className="overlay-button refresh !p-2 !m-0"
+                                                                title="Perbarui Gambar"
+                                                                disabled={isRegenerating}
+                                                            >
+                                                                {isRegenerating ? (
+                                                                    <Loader2 className="w-5 h-5 animate-spin" />
+                                                                ) : (
+                                                                    <RefreshCcw className="w-5 h-5" />
+                                                                )}
+                                                            </button>
+                                                        </div>
+                                                    </>
+                                                ) : (
+                                                    null // Menghapus teks placeholder
+                                                )}
+                                            </div>
+
+                                            {/* Skenario Prompt */}
+                                            {currentImageBase64 && (
+                                                <div className="w-full mt-3">
+                                                    {videoPrompts[categoryKey]?.[index] ? (
+                                                        <div className="p-3 bg-gray-200/70 rounded-lg shadow-inner">
+                                                            <h4 className="text-sm font-semibold text-blue-700 mb-2 flex items-center">
+                                                                <Video className="w-4 h-4 mr-1.5" />
+                                                                Prompt Skenario
+                                                            </h4>
+                                                            <p className="text-xs text-gray-800 whitespace-pre-wrap">
+                                                                {videoPrompts[categoryKey][index]}
+                                                            </p>
+                                                            <button
+                                                                onClick={() => {
+                                                                    copyToClipboard(videoPrompts[categoryKey][index]);
+                                                                }}
+                                                                className="mt-2 w-full text-xs bg-emerald-600/80 hover:bg-emerald-600 text-white font-medium py-1.5 px-3 rounded-lg flex items-center justify-center transition duration-200"
+                                                            >
+                                                                <Clipboard className="w-3 h-3 mr-1.5" />
+                                                                Salin Skenario
+                                                            </button>
+                                                        </div>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => handleGenerateVideoPrompt(categoryKey, index, currentImageBase64)}
+                                                            disabled={videoPromptLoading[categoryKey]?.[index]}
+                                                            className={`w-full text-xs font-semibold py-2 px-3 rounded-lg flex items-center justify-center transition duration-300 shadow-md
+                                                                ${videoPromptLoading[categoryKey]?.[index] 
+                                                                    ? 'bg-gray-400 text-gray-700 cursor-not-allowed'
+                                                                    : 'bg-blue-400/90 hover:bg-blue-500 text-white shadow-blue-900/40'
+                                                                }`}
+                                                        >
+                                                            {videoPromptLoading[categoryKey]?.[index] ? (
+                                                                <Loader2 className="loader w-4 h-4 mr-2 animate-spin" />
+                                                            ) : (
+                                                                <Video className="w-4 h-4 mr-1.5" />
+                                                            )}
+                                                            Buat Prompt Skenario
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            )}
+
+                                            {/* Cinematic Prompt */}
+                                            {currentImageBase64 && (
+                                                <div className="w-full mt-2">
+                                                    {cinematicPrompts[categoryKey]?.[index] ? (
+                                                        <div className="p-3 bg-gray-200/70 rounded-lg shadow-inner">
+                                                            <h4 className="text-sm font-semibold text-teal-700 mb-2 flex items-center">
+                                                                <Wand2 className="w-4 h-4 mr-1.5" />
+                                                                Prompt Cinematic
+                                                            </h4>
+                                                            <p className="text-xs text-gray-800 whitespace-pre-wrap">
+                                                                {cinematicPrompts[categoryKey][index]}
+                                                            </p>
+                                                            <button
+                                                                onClick={() => {
+                                                                    copyToClipboard(cinematicPrompts[categoryKey][index]);
+                                                                }}
+                                                                className="mt-2 w-full text-xs bg-emerald-600/80 hover:bg-emerald-600 text-white font-medium py-1.5 px-3 rounded-lg flex items-center justify-center transition duration-200"
+                                                            >
+                                                                <Clipboard className="w-3 h-3 mr-1.5" />
+                                                                Salin Prompt
+                                                            </button>
+                                                        </div>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => handleGenerateCinematicPrompt(categoryKey, index, currentImageBase64)}
+                                                            disabled={cinematicPromptLoading[categoryKey]?.[index]}
+                                                            className={`w-full text-xs font-semibold py-2 px-3 rounded-lg flex items-center justify-center transition duration-300 shadow-md
+                                                                ${cinematicPromptLoading[categoryKey]?.[index] 
+                                                                    ? 'bg-gray-400 text-gray-700 cursor-not-allowed'
+                                                                    : 'bg-teal-600/90 hover:bg-teal-600 text-white shadow-teal-900/40'
+                                                                }`}
+                                                        >
+                                                            {cinematicPromptLoading[categoryKey]?.[index] ? (
+                                                                <Loader2 className="loader w-4 h-4 mr-2 animate-spin" />
+                                                            ) : (
+                                                                <Wand2 className="w-4 h-4 mr-1.5" />
+                                                            )}
+                                                            Buat Prompt Cinematic
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            )}
+
+                                            {/* Edit Angle */}
+                                            {currentImageBase64 && (
+                                                <div className="w-full mt-2">
+                                                    <button
+                                                        onClick={() => setOpenEditMenu(openEditMenu === itemKey ? null : itemKey)}
+                                                        className="w-full text-xs font-semibold py-2 px-3 rounded-lg flex items-center justify-center transition duration-300 shadow-md bg-purple-600/90 hover:bg-purple-600 text-white shadow-purple-900/40"
+                                                    >
+                                                        <Edit className="w-4 h-4 mr-1.5" />
+                                                        Edit Camera Angle
+                                                    </button>
+
+                                                    {openEditMenu === itemKey && (
+                                                        <div className="mt-2 p-3 bg-gray-200/70 rounded-lg shadow-inner space-y-2">
+                                                            {CAMERA_ANGLES.map(angle => {
+                                                                const editKey = `${itemKey}-${angle}`;
+                                                                const editedImageBase64 = editedImages[editKey];
+                                                                const isLoadingEdit = editLoading === editKey;
+
+                                                                return (
+                                                                    <div key={angle}>
+                                                                        {!editedImageBase64 && (
+                                                                            <button
+                                                                                onClick={() => handleGenerateEdit(categoryKey, index, currentImageBase64, angle)}
+                                                                                disabled={isLoadingEdit}
+                                                                                className={`w-full text-xs font-medium py-1.5 px-3 rounded-md flex items-center justify-center transition duration-200
+                                                                                    ${isLoadingEdit 
+                                                                                        ? 'bg-gray-400 text-gray-700 cursor-not-allowed'
+                                                                                        : 'bg-purple-500 hover:bg-purple-600 text-white'
+                                                                                    }`}
+                                                                            >
+                                                                                {isLoadingEdit ? (
+                                                                                    <Loader2 className="loader w-3 h-3 mr-1.5 animate-spin" />
+                                                                                ) : (
+                                                                                    <Wand2 className="w-3 h-3 mr-1.5" />
+                                                                                )}
+                                                                                {angle}
+                                                                            </button>
+                                                                        )}
+
+                                                                        {editedImageBase64 && (
+                                                                            <div className="flex items-center space-x-2">
+                                                                                <div 
+                                                                                    className="image-container w-16 h-16 bg-gray-300 rounded-md overflow-hidden border border-gray-400 flex-shrink-0"
+                                                                                    onClick={() => openLightbox(`data:image/jpeg;base64,${editedImageBase64}`)}
+                                                                                >
+                                                                                    <img src={`data:image/jpeg;base64,${editedImageBase64}`} alt={`Edit ${angle}`} className="w-full h-full object-cover" />
+                                                                                    <div className="image-overlay !flex-row !p-0 !items-center !justify-center !space-x-1">
+                                                                                        <button
+                                                                                            onClick={(e) => { e.stopPropagation(); openLightbox(`data:image/jpeg;base64,${editedImageBase64}`); }}
+                                                                                            className="overlay-button view !p-1 !m-0.5 !rounded-sm !text-xs"
+                                                                                            title="Lihat"
+                                                                                        >
+                                                                                            <Image className="w-3 h-3" />
+                                                                                        </button>
+                                                                                        <button
+                                                                                            onClick={(e) => {
+                                                                                                e.stopPropagation();
+                                                                                                downloadImage(
+                                                                                                    editedImageBase64, 
+                                                                                                    `rahayng_EDIT_${categoryKey}_${index + 1}_${angle.replace(/ /g, '_')}.jpg`
+                                                                                                );
+                                                                                            }}
+                                                                                            className="overlay-button download !p-1 !m-0.5 !rounded-sm !text-xs"
+                                                                                            title="Unduh"
+                                                                                        >
+                                                                                            <Download className="w-3 h-3" />
+                                                                                        </button>
+                                                                                    </div>
+                                                                                </div>
+                                                                                <span className="text-xs font-semibold text-gray-800 flex-grow">{angle} (Selesai)</span>
+                                                                                <button
+                                                                                    onClick={() => handleGenerateEdit(categoryKey, index, currentImageBase64, angle)}
+                                                                                    disabled={isLoadingEdit}
+                                                                                    title="Generate Ulang"
+                                                                                    className={`p-1.5 rounded-md transition duration-200 flex-shrink-0 ${isLoadingEdit ? 'bg-gray-300' : 'bg-gray-400 hover:bg-gray-500 text-white'}`}
+                                                                                >
+                                                                                    {isLoadingEdit ? <Loader2 className="loader w-3 h-3 animate-spin" /> : <Wand2 className="w-3 h-3" />}
+                                                                                </button>
+                                                                            </div>
+                                                                        )}
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                        );
+                                    })}
+                                </React.Fragment>
+                            ))}
+                        </div>
+
+                        {finalPrompts.length > 0 && (
+                            <div className="mt-6 border-t border-gray-300/50 pt-4">
+                                <h3 className="text-lg font-semibold text-gray-700 mb-2">Prompt Final yang Dikirim (Semua)</h3>
+                                <div className="bg-gray-200/70 p-4 rounded-lg text-xs text-gray-600 whitespace-pre-wrap max-h-96 overflow-y-auto">
+                                    {finalPrompts.map((prompt, idx) => (
+                                        <p key={idx} className="mb-2 border-b border-gray-300 pb-2 last:border-b-0 last:pb-0">
+                                            <span className="font-bold text-emerald-600">Prompt {idx + 1}:</span> {prompt}
+                                        </p>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Lightbox/Modal (Milik ImageGeneratorUI) */}
+            {isLightboxOpen && (
+                <div 
+                    className="fixed inset-0 bg-black bg-opacity-80 flex items-center justify-center p-4 z-50"
+                    onClick={closeLightbox} 
+                >
+                    <div className="relative max-w-full max-h-full" onClick={(e) => e.stopPropagation()}> 
+                        <button 
+                            onClick={closeLightbox} 
+                            className="absolute top-4 right-4 bg-white/30 hover:bg-white/50 text-white p-2 rounded-full transition-colors duration-200 z-10"
+                        >
+                            <X className="w-6 h-6" />
+                        </button>
+                        <img 
+                            src={lightboxImageSrc} 
+                            alt="Full Screen Preview" 
+                            className="max-w-full max-h-[90vh] object-contain rounded-lg shadow-xl"
+                        />
+                    </div>
+                </div>
+            )}
+        </>
+    );
+};
+// --- AKHIR KOMPONEN IMAGE GENERATOR ---
+
+
+// --- Komponen Utama Aplikasi (Sekarang berfungsi sebagai Router) ---
+export default function App() {
+    const [page, setPage] = useState('ttsGenerator'); // 'imageGenerator' atau 'veoCrafter' atau 'ttsGenerator'
+
+    const NavButton = ({ targetPage, children }) => (
+        <button
+            onClick={() => setPage(targetPage)}
+            className={`py-2 px-4 rounded-lg text-sm sm:text-base font-semibold transition duration-300
+                ${page === targetPage
+                    ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-700/30'
+                    : 'bg-gray-200/80 text-gray-600 hover:bg-gray-300'
+                }`}
+        >
+            {children}
+        </button>
+    );
+
+    return (
+        <div className="min-h-screen bg-white text-gray-900 font-sans p-4 sm:p-8">
+            
+            {/* Header Utama Aplikasi (DIPINDAHKAN KE SINI) */}
+            <header className="text-center mb-10 pb-4 border-b-2 border-transparent relative">
+                <h1 className="text-4xl sm:text-5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-emerald-600 to-purple-600 transition duration-500">
+                    RAHYANG IMAGES GENERATOR V4.6
+                </h1>
+                <p className="mt-2 text-xl text-gray-600">
+                    Ngonten Jadi Mudah: Gabungkan Produk, Model, dan Konsep Foto dalam Sekali Klik
+                </p>
+                <div className="absolute bottom-0 left-0 w-full h-0.5 bg-gradient-to-r from-transparent via-emerald-500 to-transparent animate-pulse-slow"></div>
+            </header>
+
+            {/* Navigasi Pilihan Menu */}
+            <nav className="flex justify-center flex-wrap gap-2 sm:gap-4 mb-6 sm:mb-8 pb-4 border-b border-gray-200">
+                <NavButton targetPage="ttsGenerator">
+                    Text To Voice
+                </NavButton>
+                <NavButton targetPage="imageGenerator">
+                    RAHYANG Images Generator
+                </NavButton>
+                <NavButton targetPage="veoCrafter">
+                    Veo 3 Prompt Crafter
+                </NavButton>
+            </nav>
+
+            {/* CSS Global (Dari Aplikasi Lama) */}
+            <style>{`
+                @keyframes pulse-slow {
+                    0%, 100% { opacity: 0.5; }
+                    50% { opacity: 1; }
+                }
+                .animate-pulse-slow {
+                    animation: pulse-slow 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+                }
+                .loader {
+                    border-top-color: #9333ea; /* Purple 600 */
+                    -webkit-animation: spinner 1.5s linear infinite;
+                    animation: spinner 1.s linear infinite;
+                }
+                @-webkit-keyframes spinner {
+                    0% { -webkit-transform: rotate(0deg); }
+                    100% { -webkit-transform: rotate(360deg); }
+                }
+                @keyframes spinner {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+                /* Kelas untuk efek hover pada gambar */
+                .image-container {
+                    position: relative;
+                    overflow: hidden;
+                    cursor: pointer;
+                }
+                .image-overlay {
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    bottom: 0;
+                    background: rgba(0, 0, 0, 0.6);
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    opacity: 0;
+                    transition: opacity 0.3s ease-in-out;
+                }
+                .image-container:hover .image-overlay {
+                    opacity: 1;
+                }
+                .overlay-button {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    margin: 5px;
+                    padding: 8px 12px;
+                    border-radius: 8px;
+                    font-size: 0.875rem; /* text-sm */
+                    font-weight: 600; /* font-semibold */
+                    color: white;
+                    transition: background-color 0.3s ease-in-out;
+                }
+                .overlay-button:disabled {
+                    cursor: not-allowed;
+                    opacity: 0.7;
+                }
+                .overlay-button.view {
+                    background-color: rgba(147, 51, 234, 0.8); /* purple-600 with opacity */
+                }
+                .overlay-button.view:hover {
+                    background-color: rgba(147, 51, 234, 1); /* purple-600 */
+                }
+                .overlay-button.download {
+                    background-color: rgba(16, 185, 129, 0.8); /* emerald-600 with opacity */
+                }
+                .overlay-button.download:hover {
+                    background-color: rgba(16, 185, 129, 1); /* emerald-600 */
+                }
+                /* --- CSS BARU UNTUK TOMBOL REFRESH --- */
+                .overlay-button.refresh {
+                    background-color: rgba(59, 130, 246, 0.8); /* blue-500 with opacity */
+                }
+                .overlay-button.refresh:hover:not(:disabled) {
+                    background-color: rgba(59, 130, 246, 1); /* blue-500 */
+                }
+                
+                /* --- CSS BARU DARI TTS --- */
+                .btn-filter {
+                    border: 1px solid #d1d5db; /* gray-300 */
+                    color: #374151; /* gray-700 */
+                    background-color: #f9fafb; /* gray-50 */
+                    transition: all 0.2s ease;
+                }
+                .btn-filter:hover {
+                     background-color: #f3f4f6; /* gray-100 */
+                }
+                .btn-filter.active {
+                    background-color: #10b981; /* emerald-500 */
+                    color: #ffffff;
+                    border-color: #059669; /* emerald-600 */
+                    box-shadow: 0 2px 4px rgba(16, 185, 129, 0.3);
+                }
+                /* Menggunakan .loader dari CSS yang sudah ada, tapi jika diperlukan bisa pakai ini */
+                .loading-spinner {
+                    border-top-color: transparent;
+                    border-left-color: transparent;
+                    animation: spinner 1s linear infinite; /* Gunakan keyframe 'spinner' yang sudah ada */
+                }
+
+            `}</style>
+
+            {/* Konten Halaman yang Aktif */}
+            {/* MODIFIKASI: Mengubah dari conditional rendering (&&) menjadi display:none.
+                Ini akan menjaga state kedua komponen tetap 'hidup' (tidak ter-unmount) saat berpindah tab,
+                sehingga foto yang diunggah tidak hilang.
+            */}
+            <div style={{ display: page === 'ttsGenerator' ? 'block' : 'none' }}>
+                <TTSGenerator />
+            </div>
+            <div style={{ display: page === 'imageGenerator' ? 'block' : 'none' }}>
+                <ImageGeneratorUI />
+            </div>
+            <div style={{ display: page === 'veoCrafter' ? 'block' : 'none' }}>
+                <VeoPromptCrafter />
+            </div>
+            
+        </div>
+    );
+}
